@@ -1,0 +1,39 @@
+ninja_required_version = 1.3
+cxx = c++
+nvcc = /opt/cuda/bin/nvcc
+
+cflags = -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O3 -Wall -march=x86-64 -mtune=generic -O2 -pipe -fno-plt -fexceptions -Wp,-D_FORTIFY_SOURCE=3 -Wformat -Werror=format-security -fstack-clash-protection -fcf-protection -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -g -ffile-prefix-map=/home/prakhar/.cache/yay/python312/src=/usr/src/debug/python312 -flto=auto -fno-semantic-interposition -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -march=x86-64 -mtune=generic -O2 -pipe -fno-plt -fexceptions -Wp,-D_FORTIFY_SOURCE=3 -Wformat -Werror=format-security -fstack-clash-protection -fcf-protection -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -g -ffile-prefix-map=/home/prakhar/.cache/yay/python312/src=/usr/src/debug/python312 -flto=auto -fno-semantic-interposition -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -march=x86-64 -mtune=generic -O2 -pipe -fno-plt -fexceptions -Wp,-D_FORTIFY_SOURCE=3 -Wformat -Werror=format-security -fstack-clash-protection -fcf-protection -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -g -ffile-prefix-map=/home/prakhar/.cache/yay/python312/src=/usr/src/debug/python312 -flto=auto -fno-semantic-interposition -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -fPIC -I/home/prakhar/Projects/myCustomCUDAEngine/csrc/includes -I/home/prakhar/Projects/myCustomCUDAEngine/venv/lib/python3.12/site-packages/torch/include -I/home/prakhar/Projects/myCustomCUDAEngine/venv/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -I/opt/cuda/include -I/home/prakhar/Projects/myCustomCUDAEngine/venv/include -I/usr/include/python3.12 -c
+post_cflags = -O3 -std=c++17 -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=my_cuda_engine_cpp
+cuda_cflags = -I/home/prakhar/Projects/myCustomCUDAEngine/csrc/includes -I/home/prakhar/Projects/myCustomCUDAEngine/venv/lib/python3.12/site-packages/torch/include -I/home/prakhar/Projects/myCustomCUDAEngine/venv/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -I/opt/cuda/include -I/home/prakhar/Projects/myCustomCUDAEngine/venv/include -I/usr/include/python3.12 -c
+cuda_post_cflags = -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -lineinfo -Xptxas=-v --use_fast_math -gencode=arch=compute_86,code=sm_86 -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=my_cuda_engine_cpp
+cuda_dlink_post_cflags = 
+sycl_dlink_post_cflags = 
+ldflags = 
+
+rule compile
+  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags
+  depfile = $out.d
+  deps = gcc
+
+rule cuda_compile
+  depfile = $out.d
+  deps = gcc
+  command = $nvcc -MD -MF $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags
+
+
+
+
+
+
+
+build /home/prakhar/Projects/myCustomCUDAEngine/build/temp.linux-x86_64-cpython-312/csrc/bindings.o: compile /home/prakhar/Projects/myCustomCUDAEngine/csrc/bindings.cpp
+build /home/prakhar/Projects/myCustomCUDAEngine/build/temp.linux-x86_64-cpython-312/csrc/kernels/rmsnorm.o: cuda_compile /home/prakhar/Projects/myCustomCUDAEngine/csrc/kernels/rmsnorm.cu
+build /home/prakhar/Projects/myCustomCUDAEngine/build/temp.linux-x86_64-cpython-312/csrc/kernels/swiglu.o: cuda_compile /home/prakhar/Projects/myCustomCUDAEngine/csrc/kernels/swiglu.cu
+
+
+
+
+
+
+
+

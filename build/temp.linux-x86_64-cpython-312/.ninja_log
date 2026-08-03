@@ -1,0 +1,4 @@
+# ninja log v7
+0	17214	1785725168974236608	/home/prakhar/Projects/myCustomCUDAEngine/build/temp.linux-x86_64-cpython-312/csrc/bindings.o	c220751e49043354
+0	31874	1785725168975769810	/home/prakhar/Projects/myCustomCUDAEngine/build/temp.linux-x86_64-cpython-312/csrc/kernels/swiglu.o	e5892048a72f070d
+43	27929	1785725216241093247	/home/prakhar/Projects/myCustomCUDAEngine/build/temp.linux-x86_64-cpython-312/csrc/kernels/rmsnorm.o	d5a5f9a0b0ab06ee

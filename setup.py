@@ -1,18 +1,21 @@
 import os
-
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-# Optimization flags for modern NVCC compilers
 extra_compile_args = {
     "cxx": ["-O3", "-std=c++17"],
     "nvcc": [
         "-O3",
         "-std=c++17",
+        "-lineinfo",          # <-- 1. keep source->SASS mapping
+        "-Xptxas=-v",         # <-- 2. print regs/smem per kernel
         "--use_fast_math",
-        "-gencode=arch=compute_80,code=sm_80",  # Ampere (A100)
-        "-gencode=arch=compute_89,code=sm_89",  # Ada (RTX 4090)
-        "-gencode=arch=compute_90,code=sm_90",  # Hopper (H100)
+        # For development, ONLY compile for YOUR GPU. 10x faster build.
+        "-gencode=arch=compute_86,code=sm_86",
+        # For release build, add others back:
+        # "-gencode=arch=compute_80,code=sm_80",
+        # "-gencode=arch=compute_89,code=sm_89",
+        # "-gencode=arch=compute_90,code=sm_90",
     ],
 }
 
