@@ -1,6 +1,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
 
 __device__ __forceinline__ float silu(float x) { return x / (1.0f + expf(-x)); }
 
@@ -40,8 +41,9 @@ torch::Tensor swiglu_cuda(torch::Tensor gate_up) {
 
   int num_threads = 256;
   int num_blocks = (num_tokens * half_size + num_threads - 1) / num_threads;
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  swiglu_kernel_fp16<<<num_blocks, num_threads>>>(
+  swiglu_kernel_fp16<<<num_blocks, num_threads, 0, stream>>>(
       reinterpret_cast<const __half *>(gate_up.data_ptr<at::Half>()),
       reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
       intermediate_size);
