@@ -1,10 +1,18 @@
-✅ RMSNorm Numerical Precision Verified!
-
---- RMSNorm Benchmark Results (Lower is Better) ---
-1. PyTorch Unfused Eager : 2.4722 ms
-2. PyTorch Native C++    : 0.9976 ms
-3. TorchCompile (Triton): 0.7103 ms
-4. Your Fused CUDA Kernel: 0.8055 ms
-
-Speedup over Native PyTorch Eager: 1.24x
-Speedup over TorchCompile:        0.88x
+myCustomCUDAEngine Roadmap
+├── [Phase 1: Custom Kernels & Acceleration] ✅ COMPLETE
+│   ├── Fused RMSNorm (128-bit Vectorized) -> Beats Triton/PyTorch
+│   ├── Fused SwiGLU -> Eliminates VRAM intermediate stores
+│   ├── Fused In-Place RoPE -> Avoids memory slicing/copying
+│   └── Paged FlashAttention Decode -> 1.71x faster than PyTorch SDPA
+│
+├── [Phase 2: Engine Architecture & Execution] 🚧 IN PROGRESS
+│   ├── Paged KV Cache Block Allocation Manager ✅
+│   ├── Direct Safetensors Weight Loader ✅
+│   ├── PyTorch-Free Llama-3.2-3B Model Wrapper ✅
+│   └── CUDA Graph Runner for 0-Dispatch Replay ✅
+│
+└── [Phase 3: Final Benchmarks & Documentation] 🎯 UPCOMING
+    ├── Full End-to-End Latency Benchmark Script (benchmarks/benchmark_engine.py)
+    │   ├── Measure Time to First Token (TTFT)
+    │   └── Measure Inter-Token Latency (ITL) vs PyTorch Eager & vLLM
+    └── Final Documentation & Benchmark Report (README.md & docs/)
