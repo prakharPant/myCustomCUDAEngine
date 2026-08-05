@@ -1,1 +1,32 @@
+# Build & packaging
+build/
+*.so
+*.o
+*.egg-info/
+dist/
+*.egg
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+.Python
 venv/
+.venv/
+env/
+
+# CUDA / profiling / temp
+*.ncu-rep
+*.nsys-rep
+*.sass
+*.ptx
+sass_so.txt
+*_report.txt
+*.log
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
