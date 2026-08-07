@@ -31,7 +31,8 @@ setup(
                 "csrc/kernels/swiglu.cu",
                 "csrc/kernels/paged_kv.cu",
                 "csrc/kernels/flash_attn_paged.cu",
-                "csrc/kernels/rope.cu"
+                "csrc/kernels/rope.cu",
+                "csrc/kernels/prefill_attention.cu"
             ],
             include_dirs=[os.path.abspath("csrc/includes")],
             extra_compile_args=extra_compile_args,

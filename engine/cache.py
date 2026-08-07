@@ -14,6 +14,7 @@ class KVCacheManager:
     ):
         self.block_size = block_size
         self.num_blocks = num_blocks
+        self.device = device
         
         # Physical KV Cache Tensor Allocation
         # [num_layers, 2, num_blocks, block_size, num_heads, head_dim]
@@ -47,10 +48,10 @@ class KVCacheManager:
     def get_block_table_tensor(self, seq_ids: List[int], max_blocks_per_seq: int) -> torch.Tensor:
         """Pads and returns block table as a 2D CUDA tensor [batch_size, max_blocks]."""
         batch_size = len(seq_ids)
-        tensor = torch.zeros((batch_size, max_blocks_per_seq), dtype=torch.int32, device="cuda")
-        
+        tensor = torch.zeros((batch_size, max_blocks_per_seq), dtype=torch.int32, device=self.device)
+
         for i, seq_id in enumerate(seq_ids):
-            blocks = self.block_tables[seq_id]
-            tensor[i, :len(blocks)] = torch.tensor(blocks, dtype=torch.int32)
-            
+            blocks = self.block_tables[seq_id][:max_blocks_per_seq]
+            tensor[i, :len(blocks)] = torch.tensor(blocks, dtype=torch.int32, device=self.device)
+
         return tensor

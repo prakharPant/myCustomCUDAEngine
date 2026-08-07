@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import torch
 
@@ -37,12 +37,13 @@ class CUDAGraphRunner:
         self.is_captured: bool = False
 
     def _prepare_inputs(
-        self, seq_ids: List[int], context_lens: torch.Tensor
+        self, seq_ids: List[int], context_lens: torch.Tensor, max_blocks: Optional[int] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, int]:
         batch_size = len(seq_ids)
-        max_blocks = (
-            context_lens.max().item() + self.model.cache_manager.block_size - 1
-        ) // self.model.cache_manager.block_size
+        if max_blocks is None:
+          max_blocks = (
+              context_lens.max().item() + self.model.cache_manager.block_size - 1
+          ) // self.model.cache_manager.block_size
 
         slot_mapping = torch.zeros((batch_size,), dtype=torch.int32, device=self.device)
         for i, seq_id in enumerate(seq_ids):
@@ -156,30 +157,22 @@ class CUDAGraphRunner:
         seq_ids: List[int],
         context_lens: torch.Tensor,
     ) -> torch.Tensor:
-        if self.is_captured:
-            batch_size = input_ids.size(0)
-            slot_mapping, block_tables, max_blocks = self._prepare_inputs(
-                seq_ids, context_lens
-            )
+        assert self.is_captured, "CUDA Graph must be captured before execution!"
+        batch_size = input_ids.size(0)
 
-            # Copy directly into pre-allocated static buffers using views for batch_size
-            self.static_input_ids[:batch_size].copy_(input_ids)
-            self.static_positions[:batch_size].copy_(positions)
-            self.static_context_lens[:batch_size].copy_(context_lens)
-            self.static_slot_mapping[:batch_size].copy_(slot_mapping)
-            self.static_block_tables[:batch_size, :max_blocks].copy_(block_tables)
+        # 1. Update slot mapping & block tables for the current step
+        slot_mapping, block_tables, _ = self._prepare_inputs(
+            seq_ids, context_lens, max_blocks=self.max_blocks_per_seq
+        )
 
-            self.cuda_graph.replay()
-            return self.static_logits[:batch_size]
-        else:
-            slot_mapping, block_tables, max_blocks = self._prepare_inputs(
-                seq_ids, context_lens
-            )
-            return self.model.decode_step(
-                input_ids,
-                positions,
-                context_lens,
-                slot_mapping,
-                block_tables,
-                max_blocks,
-            )
+        # 2. In-place copy updated dynamic step inputs into static graph memory addresses
+        self.static_input_ids[:batch_size].copy_(input_ids)
+        self.static_positions[:batch_size].copy_(positions)
+        self.static_context_lens[:batch_size].copy_(context_lens)
+        self.static_slot_mapping[:batch_size].copy_(slot_mapping)
+        self.static_block_tables[:batch_size, :self.max_blocks_per_seq].copy_(block_tables)
+
+        # 3. Replay captured graph
+        self.cuda_graph.replay()
+
+        return self.static_logits[:batch_size]
