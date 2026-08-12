@@ -30,3 +30,5 @@ sass_so.txt
 .vscode/
 *.swp
 .DS_Store
+
+scripts/

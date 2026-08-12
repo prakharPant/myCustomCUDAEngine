@@ -32,7 +32,9 @@ setup(
                 "csrc/kernels/paged_kv.cu",
                 "csrc/kernels/flash_attn_paged.cu",
                 "csrc/kernels/rope.cu",
-                "csrc/kernels/prefill_attention.cu"
+                "csrc/kernels/prefill_attention.cu",
+                "csrc/kernels/prefill_attention/level1_mma_microtest.cu",
+                "csrc/kernels/prefill_attention/level2_tile_attn.cu"
             ],
             include_dirs=[os.path.abspath("csrc/includes")],
             extra_compile_args=extra_compile_args,

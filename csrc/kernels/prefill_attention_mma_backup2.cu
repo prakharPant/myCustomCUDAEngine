@@ -3,11 +3,13 @@
 #include <cuda_runtime.h>
 #include <cmath>
 
+// FlashAttention-2 optimized Tile Sizes
 #define TILE_M 128    
-#define TILE_N 64     
+#define TILE_N 64    
 #define HEAD_DIM 128
 #define WARP_SIZE 32
 
+// Bitwise Swizzle Macros to prevent Shared Memory Bank Conflicts
 #define SWIZZLE_128(row, col) (((row) << 7) | ((col) ^ (((row) & 7) << 3)))
 #define SWIZZLE_64(row, col)  (((row) << 6) | ((col) ^ (((row) & 7) << 3)))
 
@@ -93,25 +95,32 @@ __global__ void prefill_attention_kernel(
 ) {
     const int b_idx = blockIdx.z;
     const int h_idx = blockIdx.y;
-    const int m_idx = blockIdx.x;    
+    const int m_idx = blockIdx.x;   
     
     const int gqa_ratio = num_heads / num_kv_heads;
     const int kv_h_idx = h_idx / gqa_ratio;
     
     const int tid = threadIdx.x;
-    const int warp_id = tid >> 5;   
+    const int warp_id = tid >> 5;  
     const int lane_id = tid & 31;   
-    const int warp_m = warp_id;  
+
+    // TILE_M = 128. 8 Warps split exactly across M (16 rows per warp)
+    const int warp_m = warp_id; 
 
     extern __shared__ half smem_raw[];
+    half* smem_Q = smem_raw;                                   // 32 KB
+    half* smem_K[2] = {smem_Q + 16384, smem_Q + 16384 + 8192}; // 16 KB + 16 KB
+    half* smem_V[2] = {smem_K[1] + 8192, smem_K[1] + 16384};   // 16 KB + 16 KB
+    half* smem_P = smem_Q;                                     // Alias Q for P later
 
-    // Phase 1: Load Q into Shared Memory
-    half* smem_Q = smem_raw; 
     const int q_offset = ((b_idx * seq_len + m_idx * TILE_M) * num_heads + h_idx) * HEAD_DIM;
+    const int kv_base_offset = (b_idx * seq_len * num_kv_heads + kv_h_idx) * HEAD_DIM;
+    const int kv_stride = num_kv_heads * HEAD_DIM;
 
+    // 1. Load Q into Shared Memory
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        int idx = tid + i * 256;  
+        int idx = tid + i * 256; 
         int row = idx / 16;
         int col = (idx % 16) * 8;
         if (m_idx * TILE_M + row < seq_len) {
@@ -124,31 +133,22 @@ __global__ void prefill_attention_kernel(
     cp_async_wait<0>();
     __syncthreads();
 
-    // Load Q into Registers
+    // 2. Load Q into Registers (FlashAttention-2 trick)
     uint32_t q_frags[8][4];
     #pragma unroll
     for (int k_step = 0; k_step < 8; ++k_step) {
         int q_row = warp_m * 16 + (lane_id % 16);
-        int q_col = k_step * 16 + (lane_id / 16) * 8;
+        int q_col = k_step * 16 + (lane_id / 16) * 8; // Perfectly 16-Byte Aligned
         ldmatrix_x4(q_frags[k_step], &smem_Q[SWIZZLE_128(q_row, q_col)]);
     }
-    __syncthreads(); // Q is in registers; smem_Q is now reusable!
-
-    // Phase 2: Double-buffered K & V within 64 KB total SMEM
-    half* smem_K[2] = {smem_raw, smem_raw + 16384}; 
-    half* smem_V[2] = {smem_raw + 8192, smem_raw + 24576};  
-    half* smem_P = smem_raw; 
-
-    const int kv_base_offset = (b_idx * seq_len * num_kv_heads + kv_h_idx) * HEAD_DIM;
-    const int kv_stride = num_kv_heads * HEAD_DIM;
+    __syncthreads(); // Q is in registers, smem_Q is now free
 
     float m_i[2] = {-1e30f, -1e30f};
-    float l_i[2] = {0.0f, 0.0f};     
+    float l_i[2] = {0.0f, 0.0f};    
     float O_acc[16][4] = {0.0f};        
 
     const int max_kv_tile = min((m_idx + 1) * TILE_M, seq_len);
     const int num_kv_steps = (max_kv_tile + TILE_N - 1) / TILE_N;
-    const int num_full_steps = (m_idx * TILE_M) / TILE_N;
 
     auto load_kv = [&](int k_tile_idx, int stage_idx) {
         int r_base = k_tile_idx * TILE_N;
@@ -164,6 +164,7 @@ __global__ void prefill_attention_kernel(
         }
     };
 
+    // Prologue: Issue first stage
     if (0 < num_kv_steps) {
         load_kv(0, 0);
         cp_async_commit();
@@ -182,7 +183,7 @@ __global__ void prefill_attention_kernel(
         else cp_async_wait<0>();
         __syncthreads();
 
-        float S_acc[8][4] = {0.0f};
+        float S_acc[8][4] = {0.0f}; // 8 steps of 8 -> 64 cols
 
         // Q * K^T
         #pragma unroll
@@ -190,6 +191,7 @@ __global__ void prefill_attention_kernel(
             #pragma unroll
             for (int n_step = 0; n_step < 8; ++n_step) {
                 uint32_t k_frag[2];
+                // [FIXED] Proper addressing for an 8x16 ldmatrix.x2 read 
                 int k_row = n_step * 8 + (lane_id % 8);
                 int k_col = k_step * 16 + (lane_id / 8) * 8;
                 ldmatrix_x2(k_frag, &smem_K[stage][SWIZZLE_128(k_row, k_col)]);
@@ -197,33 +199,29 @@ __global__ void prefill_attention_kernel(
             }
         }
 
-        // Fused Scale, Fast Causal Splitting & Softmax
+        // Fused Scale, Causal Masking, Softmax
         float local_max[2] = {-1e30f, -1e30f};
-        const bool is_causal_tile = (k_tile >= num_full_steps);
-
         #pragma unroll
         for (int n_step = 0; n_step < 8; ++n_step) {
+            int c0 = k_tile * TILE_N + n_step * 8 + (lane_id % 4) * 2;
+            int c1 = c0 + 1;
+            int r0 = m_idx * TILE_M + warp_m * 16 + (lane_id / 4);
+            int r1 = r0 + 8;
+            
             S_acc[n_step][0] *= scale_log2; S_acc[n_step][1] *= scale_log2;
             S_acc[n_step][2] *= scale_log2; S_acc[n_step][3] *= scale_log2;
 
-            if (is_causal_tile) {
-                int c0 = k_tile * TILE_N + n_step * 8 + (lane_id % 4) * 2;
-                int c1 = c0 + 1;
-                int r0 = m_idx * TILE_M + warp_m * 16 + (lane_id / 4);
-                int r1 = r0 + 8;
-
-                if (c0 > r0) S_acc[n_step][0] = -1e30f;
-                if (c1 > r0) S_acc[n_step][1] = -1e30f;
-                if (c0 > r1) S_acc[n_step][2] = -1e30f;
-                if (c1 > r1) S_acc[n_step][3] = -1e30f;
-            }
-
+            if (c0 > r0) S_acc[n_step][0] = -1e30f;
+            if (c1 > r0) S_acc[n_step][1] = -1e30f;
+            if (c0 > r1) S_acc[n_step][2] = -1e30f;
+            if (c1 > r1) S_acc[n_step][3] = -1e30f;
+            
             local_max[0] = fmaxf(local_max[0], fmaxf(S_acc[n_step][0], S_acc[n_step][1]));
             local_max[1] = fmaxf(local_max[1], fmaxf(S_acc[n_step][2], S_acc[n_step][3]));
         }
 
         #pragma unroll
-        for (int mask = 1; mask <= 2; mask *= 2) {
+        for (int mask = 1; mask <= 2; mask *= 2) { // Reduce local max horizontally across warp columns
             local_max[0] = fmaxf(local_max[0], __shfl_xor_sync(0xffffffff, local_max[0], mask));
             local_max[1] = fmaxf(local_max[1], __shfl_xor_sync(0xffffffff, local_max[1], mask));
         }
@@ -253,6 +251,7 @@ __global__ void prefill_attention_kernel(
             int p_row1 = p_row0 + 8;
             int p_col0 = n_step * 8 + (lane_id % 4) * 2;
             
+            // Write to smem_P to reset layout for matrix multiplication
             *reinterpret_cast<half2*>(&smem_P[SWIZZLE_64(p_row0, p_col0)]) = __floats2half2_rn(p0, p1);
             *reinterpret_cast<half2*>(&smem_P[SWIZZLE_64(p_row1, p_col0)]) = __floats2half2_rn(p2, p3);
         }
@@ -268,7 +267,7 @@ __global__ void prefill_attention_kernel(
         m_i[0] = m_new[0];
         m_i[1] = m_new[1];
 
-        // REMOVED redundant __syncthreads() - Warps access disjoint rows of smem_P
+        __syncthreads(); 
 
         // P * V
         #pragma unroll
@@ -281,13 +280,14 @@ __global__ void prefill_attention_kernel(
             #pragma unroll
             for (int v_step = 0; v_step < 16; ++v_step) {
                 uint32_t v_frag[2];
+                // [FIXED] Proper addressing for a 16x8 ldmatrix.x2.trans read (reads 2x vertically stacked 8x8 blocks)
                 int v_row = k_step * 16 + (lane_id % 16);
-                int v_col = v_step * 8;  
+                int v_col = v_step * 8; 
                 ldmatrix_x2_trans(v_frag, &smem_V[stage][SWIZZLE_128(v_row, v_col)]);
                 mma_m16n8k16_f32(O_acc[v_step], p_frag, v_frag);
             }
         }
-        // REMOVED second redundant __syncthreads()
+        __syncthreads();
     }
 
     #pragma unroll
@@ -309,7 +309,7 @@ __global__ void prefill_attention_kernel(
     
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        int idx = tid + i * 256;  
+        int idx = tid + i * 256; 
         int row = idx / 16;
         int col = (idx % 16) * 8;
         if (m_idx * TILE_M + row < seq_len) {
@@ -320,8 +320,7 @@ __global__ void prefill_attention_kernel(
 }
 
 torch::Tensor prefill_attention_cuda(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v, float scale,
-    c10::optional<torch::Tensor> out_opt = c10::nullopt
+    torch::Tensor q, torch::Tensor k, torch::Tensor v, float scale
 ) {
     const int batch_size = q.size(0);
     const int seq_len = q.size(1);
@@ -329,19 +328,14 @@ torch::Tensor prefill_attention_cuda(
     const int num_kv_heads = k.size(2);
     const int head_dim = q.size(3);
 
-    torch::Tensor out;
-    if (out_opt.has_value()) {
-        out = out_opt.value();
-    } else {
-        auto options = torch::TensorOptions().dtype(q.dtype()).device(q.device());
-        out = torch::empty({batch_size, seq_len, num_heads, head_dim}, options);
-    }
+    auto options = torch::TensorOptions().dtype(q.dtype()).device(q.device());
+    torch::Tensor out = torch::empty({batch_size, seq_len, num_heads, head_dim}, options);
 
     dim3 grid((seq_len + TILE_M - 1) / TILE_M, num_heads, batch_size);
     dim3 block(256);
 
-    // Dynamic SMEM size reduced from 96 KB to 64 KB -> Doubles active blocks per SM
-    size_t smem_bytes = 64 * 1024;
+    // 96 KB SMEM Allocation -> Fits strictly under sm_86's 100KB limit
+    size_t smem_bytes = 96 * 1024;
 
     static bool attr_set = false;
     if (!attr_set) {

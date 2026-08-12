@@ -16,3 +16,25 @@ myCustomCUDAEngine Roadmap
     │   ├── Measure Time to First Token (TTFT)
     │   └── Measure Inter-Token Latency (ITL) vs PyTorch Eager & vLLM
     └── Final Documentation & Benchmark Report (README.md & docs/)
+
+ ====================================================================================================
+
+🚀 PREFILL ATTENTION BENCHMARK (PyTorch Native GQA Support: True)
+
+====================================================================================================
+
+Seq Len  | Status | Max Diff   | Custom CUDA (ms) | PyTorch SDPA (ms)  | Speedup  
+
+----------------------------------------------------------------------------------------------------
+
+128      | PASSED | 9.7656e-04 | 0.0216           | 0.0186             | 0.87x
+
+256      | PASSED | 4.8828e-04 | 0.0593           | 0.0325             | 0.55x
+
+512      | PASSED | 4.8828e-04 | 0.1403           | 0.0941             | 0.67x
+
+1024     | PASSED | 4.8828e-04 | 0.3980           | 0.2853             | 0.72x
+
+2048     | PASSED | 4.8828e-04 | 1.2723           | 0.8919             | 0.70x
+
+==================================================================================================== 
