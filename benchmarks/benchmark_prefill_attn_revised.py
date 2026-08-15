@@ -35,7 +35,7 @@ def benchmark_prefill_kernel_vs_pytorch():
     num_kv_heads = 8
     head_dim = 128
     
-    seq_lengths = [128, 256, 512, 1024, 2048]
+    seq_lengths = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
     scale = 1.0 / math.sqrt(head_dim)
 
     # Detect SDPA Native GQA support

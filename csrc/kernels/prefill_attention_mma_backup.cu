@@ -3,20 +3,17 @@
 #include <cuda_runtime.h>
 #include <cmath>
 
-
-// Add these macros at the top of your file, below the includes:
-// Standard XOR Swizzling to eliminate ldmatrix memory bank conflicts
-#define SWIZZLE_128(row, col) ((row) * 128 + ((col) ^ (((row) & 7) * 8)))
-#define SWIZZLE_64(row, col)  ((row) * 64  + ((col) ^ (((row) & 7) * 8)))
-#define TILE_M 64   
-#define TILE_N 64   
+#define TILE_M 64     
+#define TILE_N 32      
 #define HEAD_DIM 128
 #define WARP_SIZE 32
 
-// ADD THIS HELPER FUNCTION
-__device__ __forceinline__ uint32_t __pack_half2(half a, half b) {
-    __half2 res = __halves2half2(a, b);
-    return *reinterpret_cast<uint32_t*>(&res);
+#define SWIZZLE_128(row, col) (((row) << 7) | ((col) ^ (((row) & 7) << 3)))
+#define SWIZZLE_64(row, col)  (((row) << 6) | ((col) ^ (((row) & 7) << 3))) 
+
+__device__ __forceinline__ void cp_async_ca_16(void* smem_ptr, const void* gmem_ptr) {
+    uint32_t smem_addr = __cvta_generic_to_shared(smem_ptr);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" :: "r"(smem_addr), "l"(gmem_ptr));
 }
 
 __device__ __forceinline__ void cp_async_cg_16(void* smem_ptr, const void* gmem_ptr) {
@@ -33,49 +30,165 @@ __device__ __forceinline__ void cp_async_wait() {
     asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
 }
 
-__device__ __forceinline__ void ldmatrix_x4(uint32_t* R, const void* smem_ptr) {
-    uint32_t smem_addr = __cvta_generic_to_shared(smem_ptr);
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-        : "=r"(R[0]), "=r"(R[1]), "=r"(R[2]), "=r"(R[3])
-        : "r"(smem_addr)
-    );
+__device__ __forceinline__ float fast_exp2(float x) {
+    float res;
+    asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(res) : "f"(x));
+    return res;
 }
 
-__device__ __forceinline__ void ldmatrix_x2(uint32_t* R, const void* smem_ptr) {
-    uint32_t smem_addr = __cvta_generic_to_shared(smem_ptr);
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-        : "=r"(R[0]), "=r"(R[1])
-        : "r"(smem_addr)
-    );
+__device__ __forceinline__ float fast_rcp(float x) {
+    float res;
+    asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(res) : "f"(x));
+    return res;
 }
 
-__device__ __forceinline__ void ldmatrix_x2_trans(uint32_t* R, const void* smem_ptr) {
-    uint32_t smem_addr = __cvta_generic_to_shared(smem_ptr);
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
-        : "=r"(R[0]), "=r"(R[1])
-        : "r"(smem_addr)
-    );
+__device__ __forceinline__ uint32_t pack_f32_to_h2(float a, float b) {
+    uint32_t ha = __half_as_ushort(__float2half_rn(a));
+    uint32_t hb = __half_as_ushort(__float2half_rn(b));
+    return (hb << 16) | ha;
 }
 
-__device__ __forceinline__ void mma_m16n8k16_f32(
-    float* D, const uint32_t* A, const uint32_t* B
-) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
-        : "=f"(D[0]), "=f"(D[1]), "=f"(D[2]), "=f"(D[3])
-        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
-          "r"(B[0]), "r"(B[1]),
-          "f"(D[0]), "f"(D[1]), "f"(D[2]), "f"(D[3])
-    );
-}
+#define LDMATRIX_X4(r, smem_ptr) \
+    do { \
+        uint32_t smem_addr = __cvta_generic_to_shared(smem_ptr); \
+        asm volatile( \
+            "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n" \
+            : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) \
+            : "r"(smem_addr) \
+        ); \
+    } while(0)
 
+#define LDMATRIX_X2(r0, r1, smem_ptr) \
+    do { \
+        uint32_t smem_addr = __cvta_generic_to_shared(smem_ptr); \
+        asm volatile( \
+            "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n" \
+            : "=r"(r0), "=r"(r1) \
+            : "r"(smem_addr) \
+        ); \
+    } while(0)
 
+#define LDMATRIX_X2_TRANS(r0, r1, smem_ptr) \
+    do { \
+        uint32_t smem_addr = __cvta_generic_to_shared(smem_ptr); \
+        asm volatile( \
+            "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n" \
+            : "=r"(r0), "=r"(r1) \
+            : "r"(smem_addr) \
+        ); \
+    } while(0)
 
-__global__ void prefill_attention_kernel(
+#define MMA_M16N8K16_F32(d, a, b0, b1) \
+    asm volatile( \
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 " \
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n" \
+        : "+f"(d.x), "+f"(d.y), "+f"(d.z), "+f"(d.w) \
+        : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), \
+          "r"(b0), "r"(b1) \
+    )
+
+#define LOAD_KV_TILE(k_tile_idx, K_PTR, V_PTR) \
+    do { \
+        int r_base = (k_tile_idx) * TILE_N; \
+        bool is_valid_kv = (r_base + TILE_N <= seq_len); \
+        _Pragma("unroll 4") \
+        for (int i = 0; i < 4; ++i) { \
+            int idx = tid + i * 128; \
+            int row = idx / 16; \
+            int col = (idx % 16) * 8; \
+            if (is_valid_kv || r_base + row < seq_len) { \
+                cp_async_cg_16(&(K_PTR)[SWIZZLE_128(row, col)], &K[kv_base_offset + (r_base + row) * kv_stride + col]); \
+                cp_async_cg_16(&(V_PTR)[SWIZZLE_128(row, col)], &V[kv_base_offset + (r_base + row) * kv_stride + col]); \
+            } \
+        } \
+    } while (0)
+
+// Pre-scales Q using half-precision math, removing 64 FP32 mul operations per loop
+#define PRE_SCALE_Q_FRAG(Q_FRAG) \
+    do { \
+        half2* q0 = (half2*)&(Q_FRAG).x; *q0 = __hmul2(*q0, scale_h2); \
+        half2* q1 = (half2*)&(Q_FRAG).y; *q1 = __hmul2(*q1, scale_h2); \
+        half2* q2 = (half2*)&(Q_FRAG).z; *q2 = __hmul2(*q2, scale_h2); \
+        half2* q3 = (half2*)&(Q_FRAG).w; *q3 = __hmul2(*q3, scale_h2); \
+    } while(0)
+
+#define ZERO_FLOAT4(var) var.x = 0.0f; var.y = 0.0f; var.z = 0.0f; var.w = 0.0f;
+
+#define UPDATE_MAX(S_ACC_INST) \
+    do { \
+        local_max_0 = fmaxf(local_max_0, fmaxf(S_ACC_INST.x, S_ACC_INST.y)); \
+        local_max_1 = fmaxf(local_max_1, fmaxf(S_ACC_INST.z, S_ACC_INST.w)); \
+    } while (0)
+
+#define MASK_S_ACC(N_STEP, S_ACC_INST) \
+    do { \
+        int c0 = k_tile * TILE_N + (N_STEP) * 8 + (lane_id % 4) * 2; \
+        int c1 = c0 + 1; \
+        if (c0 > r0) S_ACC_INST.x = -1e30f; \
+        if (c1 > r0) S_ACC_INST.y = -1e30f; \
+        if (c0 > r1) S_ACC_INST.z = -1e30f; \
+        if (c1 > r1) S_ACC_INST.w = -1e30f; \
+    } while(0)
+
+// Uses warp aggregation to skip FP32 math if alpha == 1 (which it will be >90% of the time)
+#define SCALE_O_ACC(O_ACC_INST) \
+    do { \
+        if (need_scale_0) { O_ACC_INST.x *= alpha_0; O_ACC_INST.y *= alpha_0; } \
+        if (need_scale_1) { O_ACC_INST.z *= alpha_1; O_ACC_INST.w *= alpha_1; } \
+    } while(0)
+
+#define COMPUTE_P_AND_STORE(N_STEP, S_ACC_INST) \
+    do { \
+        float p0 = (S_ACC_INST.x < -1e20f) ? 0.0f : fast_exp2(S_ACC_INST.x - m_new_0); \
+        float p1 = (S_ACC_INST.y < -1e20f) ? 0.0f : fast_exp2(S_ACC_INST.y - m_new_0); \
+        float p2 = (S_ACC_INST.z < -1e20f) ? 0.0f : fast_exp2(S_ACC_INST.z - m_new_1); \
+        float p3 = (S_ACC_INST.w < -1e20f) ? 0.0f : fast_exp2(S_ACC_INST.w - m_new_1); \
+        P_sum_0 += (p0 + p1); \
+        P_sum_1 += (p2 + p3); \
+        int p_col0 = (N_STEP) * 8 + (lane_id % 4) * 2; \
+        *reinterpret_cast<uint32_t*>(&smem_P[SWIZZLE_64(p_row0, p_col0)]) = pack_f32_to_h2(p0, p1); \
+        *reinterpret_cast<uint32_t*>(&smem_P[SWIZZLE_64(p_row1, p_col0)]) = pack_f32_to_h2(p2, p3); \
+    } while(0)
+
+#define COMPUTE_S_ACC_STEP(K_STEP, Q_FRAG) \
+    do { \
+        uint32_t k0_0, k0_1, k1_0, k1_1, k2_0, k2_1, k3_0, k3_1; \
+        int k_col = (K_STEP) * 16 + (lane_id / 8) * 8; \
+        LDMATRIX_X2(k0_0, k0_1, &compute_K[SWIZZLE_128(0 * 8 + (lane_id % 8), k_col)]); \
+        LDMATRIX_X2(k1_0, k1_1, &compute_K[SWIZZLE_128(1 * 8 + (lane_id % 8), k_col)]); \
+        LDMATRIX_X2(k2_0, k2_1, &compute_K[SWIZZLE_128(2 * 8 + (lane_id % 8), k_col)]); \
+        LDMATRIX_X2(k3_0, k3_1, &compute_K[SWIZZLE_128(3 * 8 + (lane_id % 8), k_col)]); \
+        MMA_M16N8K16_F32(S_acc_0, Q_FRAG, k0_0, k0_1); \
+        MMA_M16N8K16_F32(S_acc_1, Q_FRAG, k1_0, k1_1); \
+        MMA_M16N8K16_F32(S_acc_2, Q_FRAG, k2_0, k2_1); \
+        MMA_M16N8K16_F32(S_acc_3, Q_FRAG, k3_0, k3_1); \
+    } while(0)
+
+#define COMPUTE_O_ACC_GROUP(V_START, O_ACC_0, O_ACC_1, O_ACC_2, O_ACC_3) \
+    do { \
+        uint32_t v0_0, v0_1, v1_0, v1_1, v2_0, v2_1, v3_0, v3_1; \
+        LDMATRIX_X2_TRANS(v0_0, v0_1, &compute_V[SWIZZLE_128(v_row, (V_START + 0) * 8)]); \
+        LDMATRIX_X2_TRANS(v1_0, v1_1, &compute_V[SWIZZLE_128(v_row, (V_START + 1) * 8)]); \
+        LDMATRIX_X2_TRANS(v2_0, v2_1, &compute_V[SWIZZLE_128(v_row, (V_START + 2) * 8)]); \
+        LDMATRIX_X2_TRANS(v3_0, v3_1, &compute_V[SWIZZLE_128(v_row, (V_START + 3) * 8)]); \
+        MMA_M16N8K16_F32(O_ACC_0, p_frag, v0_0, v0_1); \
+        MMA_M16N8K16_F32(O_ACC_1, p_frag, v1_0, v1_1); \
+        MMA_M16N8K16_F32(O_ACC_2, p_frag, v2_0, v2_1); \
+        MMA_M16N8K16_F32(O_ACC_3, p_frag, v3_0, v3_1); \
+    } while(0)
+
+#define STORE_O_ACC(V_STEP, O_ACC_INST) \
+    do { \
+        int col_0 = (V_STEP) * 8 + (lane_id % 4) * 2; \
+        float o0 = O_ACC_INST.x * rcp_l0; \
+        float o1 = O_ACC_INST.y * rcp_l0; \
+        float o2 = O_ACC_INST.z * rcp_l1; \
+        float o3 = O_ACC_INST.w * rcp_l1; \
+        *reinterpret_cast<uint32_t*>(&smem_O[SWIZZLE_128(row_0, col_0)]) = pack_f32_to_h2(o0, o1); \
+        *reinterpret_cast<uint32_t*>(&smem_O[SWIZZLE_128(row_1, col_0)]) = pack_f32_to_h2(o2, o3); \
+    } while(0)
+
+__global__ void __launch_bounds__(128, 2) prefill_attention_kernel(
     const half* __restrict__ Q,
     const half* __restrict__ K,
     const half* __restrict__ V,
@@ -87,249 +200,223 @@ __global__ void prefill_attention_kernel(
 ) {
     const int b_idx = blockIdx.z;
     const int h_idx = blockIdx.y;
-    const int m_idx = blockIdx.x;  
+    const int m_idx = blockIdx.x;    
     
     const int gqa_ratio = num_heads / num_kv_heads;
     const int kv_h_idx = h_idx / gqa_ratio;
+    
     const int tid = threadIdx.x;
-    const int warp_id = tid / WARP_SIZE;
-    const int lane_id = tid % WARP_SIZE;
+    const int warp_id = tid >> 5;   
+    const int lane_id = tid & 31;   
+    const int warp_m = warp_id;  
 
-    extern __shared__ char smem_raw[];
-    half* smem_Q = reinterpret_cast<half*>(smem_raw);                                
-    half* smem_K = smem_Q + (TILE_M * HEAD_DIM);                                     
-    half* smem_V = smem_K + (2 * TILE_N * HEAD_DIM);                                 
-    half* smem_P = smem_V + (2 * TILE_N * HEAD_DIM);                                 
+    extern __shared__ half smem_raw[];
 
+    half* smem_Q = smem_raw; 
     const int q_offset = ((b_idx * seq_len + m_idx * TILE_M) * num_heads + h_idx) * HEAD_DIM;
-    const int kv_base_offset = (b_idx * seq_len * num_kv_heads + kv_h_idx) * HEAD_DIM;
-    const int kv_stride = num_kv_heads * HEAD_DIM;
+    const bool is_valid_q = (m_idx * TILE_M + TILE_M <= seq_len);
 
-    // Async Load Q Tile (Swizzled)
-    for (int i = tid * 8; i < TILE_M * HEAD_DIM; i += blockDim.x * 8) {
-        int row = i / HEAD_DIM;
-        int col = i % HEAD_DIM;
-        if (m_idx * TILE_M + row < seq_len) {
+    #pragma unroll 8
+    for (int i = 0; i < 8; ++i) {
+        int idx = tid + i * 128;
+        int row = idx / 16;
+        int col = (idx % 16) * 8;
+        if (is_valid_q || m_idx * TILE_M + row < seq_len) {
             cp_async_cg_16(&smem_Q[SWIZZLE_128(row, col)], &Q[q_offset + row * num_heads * HEAD_DIM + col]);
         } else {
             *reinterpret_cast<int4*>(&smem_Q[SWIZZLE_128(row, col)]) = make_int4(0, 0, 0, 0);
         }
     }
     cp_async_commit();
+    cp_async_wait<0>();
+    __syncthreads();
 
-    float m_i[2] = {-1e30f, -1e30f};
-    float l_i[2] = {0.0f, 0.0f};    
-    float O_acc[16][4] = {0.0f};        
+    uint4 q_frag_0, q_frag_1, q_frag_2, q_frag_3, q_frag_4, q_frag_5, q_frag_6, q_frag_7;
+    int q_row = warp_m * 16 + (lane_id % 16);
+    
+    // Natively packing the scalar float multiplier to apply across half2 registers
+    half2 scale_h2 = __floats2half2_rn(scale_log2, scale_log2);
+
+    LDMATRIX_X4(q_frag_0, &smem_Q[SWIZZLE_128(q_row, 0 * 16 + (lane_id / 16) * 8)]); PRE_SCALE_Q_FRAG(q_frag_0);
+    LDMATRIX_X4(q_frag_1, &smem_Q[SWIZZLE_128(q_row, 1 * 16 + (lane_id / 16) * 8)]); PRE_SCALE_Q_FRAG(q_frag_1);
+    LDMATRIX_X4(q_frag_2, &smem_Q[SWIZZLE_128(q_row, 2 * 16 + (lane_id / 16) * 8)]); PRE_SCALE_Q_FRAG(q_frag_2);
+    LDMATRIX_X4(q_frag_3, &smem_Q[SWIZZLE_128(q_row, 3 * 16 + (lane_id / 16) * 8)]); PRE_SCALE_Q_FRAG(q_frag_3);
+    LDMATRIX_X4(q_frag_4, &smem_Q[SWIZZLE_128(q_row, 4 * 16 + (lane_id / 16) * 8)]); PRE_SCALE_Q_FRAG(q_frag_4);
+    LDMATRIX_X4(q_frag_5, &smem_Q[SWIZZLE_128(q_row, 5 * 16 + (lane_id / 16) * 8)]); PRE_SCALE_Q_FRAG(q_frag_5);
+    LDMATRIX_X4(q_frag_6, &smem_Q[SWIZZLE_128(q_row, 6 * 16 + (lane_id / 16) * 8)]); PRE_SCALE_Q_FRAG(q_frag_6);
+    LDMATRIX_X4(q_frag_7, &smem_Q[SWIZZLE_128(q_row, 7 * 16 + (lane_id / 16) * 8)]); PRE_SCALE_Q_FRAG(q_frag_7);
+
+    half* smem_K_0 = smem_raw;  
+    half* smem_K_1 = smem_raw + 4096;  
+    half* smem_V_0 = smem_raw + 8192;  
+    half* smem_V_1 = smem_raw + 12288;  
+    half* smem_P   = smem_raw + 16384; 
+
+    half* smem_K_load = smem_K_0;
+    half* smem_V_load = smem_V_0;
+    half* smem_K_compute = smem_K_0;
+    half* smem_V_compute = smem_V_0;
+
+    const int kv_base_offset = (b_idx * seq_len * num_kv_heads + kv_h_idx) * HEAD_DIM;
+    const int kv_stride = num_kv_heads * HEAD_DIM;
+
+    float m_i_0 = -1e30f, m_i_1 = -1e30f;
+    float l_i_0 = 0.0f, l_i_1 = 0.0f;     
+    
+    float4 O_acc_0, O_acc_1, O_acc_2, O_acc_3, O_acc_4, O_acc_5, O_acc_6, O_acc_7;
+    float4 O_acc_8, O_acc_9, O_acc_10, O_acc_11, O_acc_12, O_acc_13, O_acc_14, O_acc_15;
+    ZERO_FLOAT4(O_acc_0); ZERO_FLOAT4(O_acc_1); ZERO_FLOAT4(O_acc_2); ZERO_FLOAT4(O_acc_3);
+    ZERO_FLOAT4(O_acc_4); ZERO_FLOAT4(O_acc_5); ZERO_FLOAT4(O_acc_6); ZERO_FLOAT4(O_acc_7);
+    ZERO_FLOAT4(O_acc_8); ZERO_FLOAT4(O_acc_9); ZERO_FLOAT4(O_acc_10); ZERO_FLOAT4(O_acc_11);
+    ZERO_FLOAT4(O_acc_12); ZERO_FLOAT4(O_acc_13); ZERO_FLOAT4(O_acc_14); ZERO_FLOAT4(O_acc_15);
 
     const int max_kv_tile = min((m_idx + 1) * TILE_M, seq_len);
     const int num_kv_steps = (max_kv_tile + TILE_N - 1) / TILE_N;
-
-    // Double-Buffering Prefetch Stage 0 (Swizzled)
-    if (num_kv_steps > 0) {
-        for (int i = tid * 8; i < TILE_N * HEAD_DIM; i += blockDim.x * 8) {
-            int r = i / HEAD_DIM;
-            int c = i % HEAD_DIM;
-            if (r < seq_len) {
-                cp_async_cg_16(&smem_K[SWIZZLE_128(r, c)], &K[kv_base_offset + r * kv_stride + c]);
-                cp_async_cg_16(&smem_V[SWIZZLE_128(r, c)], &V[kv_base_offset + r * kv_stride + c]);
-            }
-        }
-        cp_async_commit();
-        cp_async_wait<1>(); 
-    } else {
-        cp_async_wait<0>();  
-    }
-    __syncthreads();
+    const int num_full_steps = (m_idx * TILE_M) / TILE_N;
 
     int stage = 0;
-    
-    for (int k_tile = 0; k_tile < num_kv_steps; ++k_tile) {
-        int next_stage = stage ^ 1;
-        int next_tile = k_tile + 1;
 
-        if (next_tile < num_kv_steps) {
-            half* smem_K_next = smem_K + next_stage * (TILE_N * HEAD_DIM);
-            half* smem_V_next = smem_V + next_stage * (TILE_N * HEAD_DIM);
-            for (int i = tid * 8; i < TILE_N * HEAD_DIM; i += blockDim.x * 8) {
-                int r = next_tile * TILE_N + (i / HEAD_DIM);
-                int c = i % HEAD_DIM;
-                if (r < seq_len) {
-                    cp_async_cg_16(&smem_K_next[SWIZZLE_128(i / HEAD_DIM, c)], &K[kv_base_offset + r * kv_stride + c]);
-                    cp_async_cg_16(&smem_V_next[SWIZZLE_128(i / HEAD_DIM, c)], &V[kv_base_offset + r * kv_stride + c]);
-                }
+    if (0 < num_kv_steps) {
+        LOAD_KV_TILE(0, smem_K_load, smem_V_load);
+        cp_async_commit();
+        cp_async_wait<0>();
+        __syncthreads();
+        smem_K_load = smem_K_1;
+        smem_V_load = smem_V_1;
+    }
+
+    for (int k_tile = 0; k_tile < num_kv_steps; ++k_tile) {
+        int next_tile = k_tile + 1;
+        bool has_next = next_tile < num_kv_steps;
+        
+        if (has_next) {
+            if (stage == 0) {
+                LOAD_KV_TILE(next_tile, smem_K_1, smem_V_1);
+            } else {
+                LOAD_KV_TILE(next_tile, smem_K_0, smem_V_0);
             }
             cp_async_commit();
-            cp_async_wait<1>(); 
-        } else {
-            cp_async_wait<0>(); 
-        }
-        __syncthreads();
-
-        half* smem_K_curr = smem_K + stage * (TILE_N * HEAD_DIM);
-        half* smem_V_curr = smem_V + stage * (TILE_N * HEAD_DIM);
-
-        float S_acc[8][4] = {0.0f};
-
-        // 1. Compute Q * K^T (Swizzled reads eliminate bank conflicts)
-        #pragma unroll
-        for (int k_step = 0; k_step < HEAD_DIM; k_step += 16) {
-            uint32_t q_frag[4];
-            int q_row = warp_id * 16 + (lane_id % 16);
-            int q_col = k_step + (lane_id / 16) * 8;
-            ldmatrix_x4(q_frag, &smem_Q[SWIZZLE_128(q_row, q_col)]);
-
-            #pragma unroll
-            for (int n_sub = 0; n_sub < 8; ++n_sub) {
-                uint32_t k_frag[2];
-                int k_row = n_sub * 8 + (lane_id % 8);
-                int k_col = k_step + ((lane_id / 8) % 2) * 8;
-                
-                ldmatrix_x2(k_frag, &smem_K_curr[SWIZZLE_128(k_row, k_col)]);
-                mma_m16n8k16_f32(S_acc[n_sub], q_frag, k_frag);
-            }
         }
 
-        // 2 & 3. Fused Scale, Causal Masking, and Online Softmax Max Reduction
-        int row_0 = warp_id * 16 + (lane_id / 4);
-        int row_1 = row_0 + 8;
-        int g_row_0 = m_idx * TILE_M + row_0;
-        int g_row_1 = m_idx * TILE_M + row_1;
-        int col_base = k_tile * TILE_N + (lane_id % 4) * 2;
-        
-        bool is_causal_tile = (m_idx == k_tile);
+        half* compute_K = (stage == 0) ? smem_K_0 : smem_K_1;
+        half* compute_V = (stage == 0) ? smem_V_0 : smem_V_1;
+
+        float4 S_acc_0, S_acc_1, S_acc_2, S_acc_3;
+        ZERO_FLOAT4(S_acc_0); ZERO_FLOAT4(S_acc_1); ZERO_FLOAT4(S_acc_2); ZERO_FLOAT4(S_acc_3);
+
+        COMPUTE_S_ACC_STEP(0, q_frag_0);
+        COMPUTE_S_ACC_STEP(1, q_frag_1);
+        COMPUTE_S_ACC_STEP(2, q_frag_2);
+        COMPUTE_S_ACC_STEP(3, q_frag_3);
+        COMPUTE_S_ACC_STEP(4, q_frag_4);
+        COMPUTE_S_ACC_STEP(5, q_frag_5);
+        COMPUTE_S_ACC_STEP(6, q_frag_6);
+        COMPUTE_S_ACC_STEP(7, q_frag_7);
+
         float local_max_0 = -1e30f, local_max_1 = -1e30f;
+        const bool is_causal_tile = (k_tile >= num_full_steps);
 
-        #pragma unroll
-        for (int n_sub = 0; n_sub < 8; ++n_sub) {
-            int c0 = col_base + n_sub * 8;
-            int c1 = c0 + 1;
+        int r0 = m_idx * TILE_M + warp_m * 16 + (lane_id / 4);
+        int r1 = r0 + 8;
 
-            // Fused Scale
-            S_acc[n_sub][0] *= scale_log2;
-            S_acc[n_sub][1] *= scale_log2;
-            S_acc[n_sub][2] *= scale_log2;
-            S_acc[n_sub][3] *= scale_log2;
-
-            // Fused Mask
-            if (is_causal_tile) {
-                if (c0 > g_row_0) S_acc[n_sub][0] = -1e30f;
-                if (c1 > g_row_0) S_acc[n_sub][1] = -1e30f;
-                if (c0 > g_row_1) S_acc[n_sub][2] = -1e30f;
-                if (c1 > g_row_1) S_acc[n_sub][3] = -1e30f;
-            }
-
-            // Fused Max (Using fast hardware fmaxf instead of generic max)
-            local_max_0 = fmaxf(local_max_0, fmaxf(S_acc[n_sub][0], S_acc[n_sub][1]));
-            local_max_1 = fmaxf(local_max_1, fmaxf(S_acc[n_sub][2], S_acc[n_sub][3]));
+        if (is_causal_tile) {
+            MASK_S_ACC(0, S_acc_0); MASK_S_ACC(1, S_acc_1);
+            MASK_S_ACC(2, S_acc_2); MASK_S_ACC(3, S_acc_3);
         }
+        
+        // Because Q was pre-scaled during load, we completely skip FP32 mults here
+        UPDATE_MAX(S_acc_0); UPDATE_MAX(S_acc_1);
+        UPDATE_MAX(S_acc_2); UPDATE_MAX(S_acc_3);
 
-        #pragma unroll
+        #pragma unroll 2
         for (int mask = 1; mask <= 2; mask *= 2) {
             local_max_0 = fmaxf(local_max_0, __shfl_xor_sync(0xffffffff, local_max_0, mask));
             local_max_1 = fmaxf(local_max_1, __shfl_xor_sync(0xffffffff, local_max_1, mask));
         }
 
-        float m_new_0 = fmaxf(m_i[0], local_max_0);
-        float m_new_1 = fmaxf(m_i[1], local_max_1);
+        float m_new_0 = fmaxf(m_i_0, local_max_0);
+        float m_new_1 = fmaxf(m_i_1, local_max_1);
+        float alpha_0 = fast_exp2(m_i_0 - m_new_0);
+        float alpha_1 = fast_exp2(m_i_1 - m_new_1);
 
-        float alpha_0 = exp2f(m_i[0] - m_new_0);
-        float alpha_1 = exp2f(m_i[1] - m_new_1);
+        // Uses a warp-wide sync to totally skip 64 FP32 multiplies if the running max has stabilized
+        bool need_scale_0 = __any_sync(0xffffffff, alpha_0 != 1.0f);
+        bool need_scale_1 = __any_sync(0xffffffff, alpha_1 != 1.0f);
 
-        #pragma unroll
-        for (int v_sub = 0; v_sub < 16; ++v_sub) {
-            O_acc[v_sub][0] *= alpha_0;
-            O_acc[v_sub][1] *= alpha_0;
-            O_acc[v_sub][2] *= alpha_1;
-            O_acc[v_sub][3] *= alpha_1;
-        }
+        SCALE_O_ACC(O_acc_0); SCALE_O_ACC(O_acc_1); SCALE_O_ACC(O_acc_2); SCALE_O_ACC(O_acc_3);
+        SCALE_O_ACC(O_acc_4); SCALE_O_ACC(O_acc_5); SCALE_O_ACC(O_acc_6); SCALE_O_ACC(O_acc_7);
+        SCALE_O_ACC(O_acc_8); SCALE_O_ACC(O_acc_9); SCALE_O_ACC(O_acc_10); SCALE_O_ACC(O_acc_11);
+        SCALE_O_ACC(O_acc_12); SCALE_O_ACC(O_acc_13); SCALE_O_ACC(O_acc_14); SCALE_O_ACC(O_acc_15);
 
         float P_sum_0 = 0.0f, P_sum_1 = 0.0f;
+        int p_row0 = warp_m * 16 + (lane_id / 4);
+        int p_row1 = p_row0 + 8;
+        
+        COMPUTE_P_AND_STORE(0, S_acc_0);
+        COMPUTE_P_AND_STORE(1, S_acc_1);
+        COMPUTE_P_AND_STORE(2, S_acc_2);
+        COMPUTE_P_AND_STORE(3, S_acc_3);
 
-        #pragma unroll
-        for (int n_sub = 0; n_sub < 8; ++n_sub) {
-            float p0 = exp2f(S_acc[n_sub][0] - m_new_0);
-            float p1 = exp2f(S_acc[n_sub][1] - m_new_0);
-            float p2 = exp2f(S_acc[n_sub][2] - m_new_1);
-            float p3 = exp2f(S_acc[n_sub][3] - m_new_1);
-
-            P_sum_0 += (p0 + p1);
-            P_sum_1 += (p2 + p3);
-
-            int c0 = n_sub * 8 + (lane_id % 4) * 2;
-            
-            // Pack and store to Swizzled layout
-            uint32_t p_01 = __pack_half2(__float2half(p0), __float2half(p1));
-            uint32_t p_23 = __pack_half2(__float2half(p2), __float2half(p3));
-
-            *reinterpret_cast<uint32_t*>(&smem_P[SWIZZLE_64(row_0, c0)]) = p_01;
-            *reinterpret_cast<uint32_t*>(&smem_P[SWIZZLE_64(row_1, c0)]) = p_23;
-        }
-
-        #pragma unroll
+        #pragma unroll 2
         for (int mask = 1; mask <= 2; mask *= 2) {
             P_sum_0 += __shfl_xor_sync(0xffffffff, P_sum_0, mask);
             P_sum_1 += __shfl_xor_sync(0xffffffff, P_sum_1, mask);
         }
 
-        l_i[0] = l_i[0] * alpha_0 + P_sum_0;
-        l_i[1] = l_i[1] * alpha_1 + P_sum_1;
-        m_i[0] = m_new_0;
-        m_i[1] = m_new_1;
+        l_i_0 = fmaf(l_i_0, alpha_0, P_sum_0);
+        l_i_1 = fmaf(l_i_1, alpha_1, P_sum_1);
+        m_i_0 = m_new_0;
+        m_i_1 = m_new_1;
 
-        __syncwarp();   
+        __syncwarp(); 
 
-        // 4. Multiply P * V (Swizzled reads)
-        #pragma unroll
-        for (int p_step = 0; p_step < 4; ++p_step) {
-            uint32_t P_frag[4];
-            int p_row = warp_id * 16 + (lane_id % 16);
-            int p_col = p_step * 16 + (lane_id / 16) * 8;
-
-            ldmatrix_x4(P_frag, &smem_P[SWIZZLE_64(p_row, p_col)]);
-
-            #pragma unroll
-            for (int v_sub = 0; v_sub < 16; ++v_sub) {
-                uint32_t v_frag[2];
-                int v_row = p_step * 16 + ((lane_id / 8) % 2) * 8 + (lane_id % 8);
-                int v_col = v_sub * 8;
-
-                ldmatrix_x2_trans(v_frag, &smem_V_curr[SWIZZLE_128(v_row, v_col)]);
-                mma_m16n8k16_f32(O_acc[v_sub], P_frag, v_frag);
-            }
+        #pragma unroll 2
+        for (int k_step = 0; k_step < 2; ++k_step) { 
+            uint4 p_frag;
+            int p_row = warp_m * 16 + (lane_id % 16);
+            int p_col = k_step * 16 + (lane_id / 16) * 8;
+            LDMATRIX_X4(p_frag, &smem_P[SWIZZLE_64(p_row, p_col)]);
+            
+            int v_row = k_step * 16 + (lane_id % 16);
+            
+            COMPUTE_O_ACC_GROUP(0, O_acc_0, O_acc_1, O_acc_2, O_acc_3);
+            COMPUTE_O_ACC_GROUP(4, O_acc_4, O_acc_5, O_acc_6, O_acc_7);
+            COMPUTE_O_ACC_GROUP(8, O_acc_8, O_acc_9, O_acc_10, O_acc_11);
+            COMPUTE_O_ACC_GROUP(12, O_acc_12, O_acc_13, O_acc_14, O_acc_15);
         }
 
-        stage = next_stage;
+        if (has_next) {
+            cp_async_wait<1>();  
+            __syncthreads();    
+            stage ^= 1; 
+        }
     }
 
     __syncthreads();  
-    half* smem_O = smem_K;  
 
-    int row_0 = warp_id * 16 + (lane_id / 4);
+    half* smem_O = smem_raw;
+    float rcp_l0 = (l_i_0 > 0.0f) ? fast_rcp(l_i_0) : 0.0f;
+    float rcp_l1 = (l_i_1 > 0.0f) ? fast_rcp(l_i_1) : 0.0f;
+
+    int row_0 = warp_m * 16 + (lane_id / 4);
     int row_1 = row_0 + 8;
-    int g_row_0 = m_idx * TILE_M + row_0;
-    int g_row_1 = m_idx * TILE_M + row_1;
-
-    #pragma unroll
-    for (int v_sub = 0; v_sub < 16; ++v_sub) {
-        int col_0 = v_sub * 8 + (lane_id % 4) * 2;
         
-        float o0 = (l_i[0] > 0.0f) ? (O_acc[v_sub][0] / l_i[0]) : O_acc[v_sub][0];
-        float o1 = (l_i[0] > 0.0f) ? (O_acc[v_sub][1] / l_i[0]) : O_acc[v_sub][1];
-        float o2 = (l_i[1] > 0.0f) ? (O_acc[v_sub][2] / l_i[1]) : O_acc[v_sub][2];
-        float o3 = (l_i[1] > 0.0f) ? (O_acc[v_sub][3] / l_i[1]) : O_acc[v_sub][3];
-
-        uint32_t o_01 = __pack_half2(__float2half(o0), __float2half(o1));
-        uint32_t o_23 = __pack_half2(__float2half(o2), __float2half(o3));
-
-        *reinterpret_cast<uint32_t*>(&smem_O[SWIZZLE_128(row_0, col_0)]) = o_01;
-        *reinterpret_cast<uint32_t*>(&smem_O[SWIZZLE_128(row_1, col_0)]) = o_23;
-    }
-
-    __syncthreads();
-
-    for (int i = tid * 8; i < TILE_M * HEAD_DIM; i += blockDim.x * 8) {
-        int row = i / HEAD_DIM;
-        int col = i % HEAD_DIM;
+    STORE_O_ACC(0, O_acc_0); STORE_O_ACC(1, O_acc_1);
+    STORE_O_ACC(2, O_acc_2); STORE_O_ACC(3, O_acc_3);
+    STORE_O_ACC(4, O_acc_4); STORE_O_ACC(5, O_acc_5);
+    STORE_O_ACC(6, O_acc_6); STORE_O_ACC(7, O_acc_7);
+    STORE_O_ACC(8, O_acc_8); STORE_O_ACC(9, O_acc_9);
+    STORE_O_ACC(10, O_acc_10); STORE_O_ACC(11, O_acc_11);
+    STORE_O_ACC(12, O_acc_12); STORE_O_ACC(13, O_acc_13);
+    STORE_O_ACC(14, O_acc_14); STORE_O_ACC(15, O_acc_15);
+    
+    __syncthreads();  
+    
+    #pragma unroll 8
+    for (int i = 0; i < 8; ++i) {
+        int idx = tid + i * 128;   
+        int row = idx / 16;
+        int col = (idx % 16) * 8;
         if (m_idx * TILE_M + row < seq_len) {
             int out_off = ((b_idx * seq_len + m_idx * TILE_M + row) * num_heads + h_idx) * HEAD_DIM + col;
             *reinterpret_cast<int4*>(&O[out_off]) = *reinterpret_cast<int4*>(&smem_O[SWIZZLE_128(row, col)]);
@@ -337,12 +424,9 @@ __global__ void prefill_attention_kernel(
     }
 }
 
-
 torch::Tensor prefill_attention_cuda(
-    torch::Tensor q,
-    torch::Tensor k,
-    torch::Tensor v,
-    float scale
+    torch::Tensor q, torch::Tensor k, torch::Tensor v, float scale,
+    c10::optional<torch::Tensor> out_opt = c10::nullopt
 ) {
     const int batch_size = q.size(0);
     const int seq_len = q.size(1);
@@ -350,22 +434,29 @@ torch::Tensor prefill_attention_cuda(
     const int num_kv_heads = k.size(2);
     const int head_dim = q.size(3);
 
-    auto options = torch::TensorOptions().dtype(q.dtype()).device(q.device());
-    torch::Tensor out = torch::empty({batch_size, seq_len, num_heads, head_dim}, options);
+    torch::Tensor out;
+    if (out_opt.has_value()) {
+        out = out_opt.value();
+    } else {
+        auto options = torch::TensorOptions().dtype(q.dtype()).device(q.device());
+        out = torch::empty({batch_size, seq_len, num_heads, head_dim}, options);
+    }
 
     dim3 grid((seq_len + TILE_M - 1) / TILE_M, num_heads, batch_size);
-    dim3 block(128);  
+    dim3 block(128); 
 
-    size_t smem_bytes = (TILE_M * HEAD_DIM + 2 * 2 * TILE_N * HEAD_DIM + TILE_M * TILE_N) * sizeof(half);
+    size_t smem_bytes = 42 * 1024; 
 
-    cudaError_t err = cudaFuncSetAttribute(
-        prefill_attention_kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        smem_bytes
-    );
-    TORCH_CHECK(err == cudaSuccess, "Failed to set max dynamic shared memory size: ", cudaGetErrorString(err));
+    static bool attr_set = false;
+    if (!attr_set) {
+        cudaFuncSetAttribute(
+            prefill_attention_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_bytes
+        );
+        attr_set = true;
+    }
 
-    // Fast log2 translation trick for standard __expf
     const float log2e = 1.4426950408889634f;
     float scale_log2 = scale * log2e;
 
@@ -374,10 +465,7 @@ torch::Tensor prefill_attention_cuda(
         reinterpret_cast<const half*>(k.data_ptr<at::Half>()),
         reinterpret_cast<const half*>(v.data_ptr<at::Half>()),
         reinterpret_cast<half*>(out.data_ptr<at::Half>()),
-        seq_len,
-        num_heads,
-        num_kv_heads,
-        scale_log2
+        seq_len, num_heads, num_kv_heads, scale_log2
     );
 
     return out;
