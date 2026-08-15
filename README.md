@@ -37,7 +37,7 @@ myCustomCUDAEngine/
 ├── docs/               # Detailed technical reports and roofline analyses
 ├── engine/             # Cache Manager, Weight Loader, and CUDA Graph Runner
 └── tests/              # End-to-end numerical precision validation suite
-
+```
 ## 🛠️ Quickstart: Build & Run
 1. Install Dependencies & Build Engine
 
