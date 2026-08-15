@@ -1,4 +1,3 @@
-import time
 import math
 import gc
 import torch
@@ -11,9 +10,10 @@ from engine.runner import CUDAGraphRunner
 
 def prefill_step(
     model: Llama3BEngineModel,
-    input_ids: torch.Tensor,      # [batch_size, seq_len]
+    input_ids: torch.Tensor,       # [batch_size, seq_len]
     seq_ids: List[int],
-    context_lens: torch.Tensor
+    context_lens: torch.Tensor,
+    use_torch_sdpa: bool = False   # Flag to switch between custom kernel vs PyTorch SDPA
 ) -> torch.Tensor:
     """
     Executes a complete FP16 Prefill pass for Llama-3.2-3B:
@@ -26,9 +26,21 @@ def prefill_step(
     num_kv_heads = model.config.num_key_value_heads
     head_dim = model.config.head_dim
     scale = 1.0 / math.sqrt(head_dim)
+    block_size = model.cache_manager.block_size
+
+    # Precompute slot mappings across all prompt positions once to avoid GPU kernel overhead
+    # slot_mappings: [seq_len, batch_size]
+    slot_mappings = torch.empty((seq_len, batch_size), dtype=torch.int32, device=input_ids.device)
+    for p in range(seq_len):
+        for i, seq_id in enumerate(seq_ids):
+            b_idx = model.cache_manager.block_tables[seq_id][p // block_size]
+            b_off = p % block_size
+            slot_mappings[p, i] = b_idx * block_size + b_off
 
     # Initial Embedding Lookup
     x = model.weights["model.embed_tokens.weight"][input_ids]  # [batch_size, seq_len, hidden_size]
+
+    pos_range = torch.arange(seq_len, dtype=torch.int32, device=input_ids.device).unsqueeze(0).repeat(batch_size, 1)
 
     for l in range(model.config.num_hidden_layers):
         layer_prefix = f"model.layers.{l}"
@@ -52,7 +64,6 @@ def prefill_step(
         # ---------------------------------------------------------------------
         # 2. Rotary Position Embeddings (RoPE) In-Place
         # ---------------------------------------------------------------------
-        pos_range = torch.arange(seq_len, dtype=torch.int32, device="cuda").unsqueeze(0).repeat(batch_size, 1)
         my_cuda_engine_cpp.rope_inplace(q, k, model.cos_table, model.sin_table, pos_range)
 
         # ---------------------------------------------------------------------
@@ -62,33 +73,32 @@ def prefill_step(
         val_cache = model.cache_manager.kv_cache[l, 1]
 
         for p in range(seq_len):
-            slot_mapping = torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
-            for i, seq_id in enumerate(seq_ids):
-                b_idx = model.cache_manager.block_tables[seq_id][p // model.cache_manager.block_size]
-                b_off = p % model.cache_manager.block_size
-                slot_mapping[i] = b_idx * model.cache_manager.block_size + b_off
-
             my_cuda_engine_cpp.paged_kv_store(
-                k[:, p], v[:, p], key_cache, val_cache, slot_mapping
+                k[:, p], v[:, p], key_cache, val_cache, slot_mappings[p]
             )
 
         # ---------------------------------------------------------------------
-        # 4. Prefill Sequence Attention (GQA-compatible SDPA with Causal Mask)
+        # 4. Prefill Sequence Attention
         # ---------------------------------------------------------------------
-        # Reshape to [batch_size, heads, seq_len, head_dim] for PyTorch SDPA
-        q_attn = q.transpose(1, 2)
-        k_attn = k.transpose(1, 2)
-        v_attn = v.transpose(1, 2)
+        if use_torch_sdpa:
+            # PyTorch SDPA Path (Native GQA support via repeat_interleave / enable_gqa=True)
+            q_attn = q.transpose(1, 2)  # [batch_size, num_heads, seq_len, head_dim]
+            k_attn = k.transpose(1, 2)  # [batch_size, num_kv_heads, seq_len, head_dim]
+            v_attn = v.transpose(1, 2)  # [batch_size, num_kv_heads, seq_len, head_dim]
 
-        # Expand K/V heads for Grouped Query Attention if needed
-        if num_heads != num_kv_heads:
-            num_queries_per_kv = num_heads // num_kv_heads
-            k_attn = k_attn.repeat_interleave(num_queries_per_kv, dim=1)
-            v_attn = v_attn.repeat_interleave(num_queries_per_kv, dim=1)
+            if num_heads != num_kv_heads:
+                num_queries_per_kv = num_heads // num_kv_heads
+                k_attn = k_attn.repeat_interleave(num_queries_per_kv, dim=1)
+                v_attn = v_attn.repeat_interleave(num_queries_per_kv, dim=1)
 
-        attn_out = my_cuda_engine_cpp.prefill_attention(q, k, v, scale)
-        attn_out = attn_out.view(batch_size, seq_len, hidden_size)
-        attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, seq_len, hidden_size)
+            attn_out = torch.nn.functional.scaled_dot_product_attention(
+                q_attn, k_attn, v_attn, is_causal=True, scale=scale
+            )
+            attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, seq_len, hidden_size)
+        else:
+            # Custom CUDA Kernel Path
+            attn_out = my_cuda_engine_cpp.prefill_attention(q, k, v, scale)
+            attn_out = attn_out.view(batch_size, seq_len, hidden_size)
 
         # Output Projection & Attention Residual Add
         w_o = model.weights[f"{layer_prefix}.self_attn.o_proj.weight"]
@@ -105,15 +115,12 @@ def prefill_step(
         w_up = model.weights[f"{layer_prefix}.mlp.up_proj.weight"]
         w_down = model.weights[f"{layer_prefix}.mlp.down_proj.weight"]
 
-        # Compute Gate and Up projections
         gate = torch.matmul(x_norm2, w_gate.T)
         up = torch.matmul(x_norm2, w_up.T)
 
-        # Concatenate along final dim for fused SwiGLU C++/CUDA kernel
         gate_up = torch.cat([gate, up], dim=-1)
         mlp_intermediate = my_cuda_engine_cpp.swiglu(gate_up)
 
-        # Down projection & MLP Residual Add
         mlp_out = torch.matmul(mlp_intermediate, w_down.T).view(batch_size, seq_len, hidden_size)
         x = residual + mlp_out
 
@@ -131,12 +138,12 @@ def prefill_step(
 
 def run_benchmark():
     device = "cuda"
-    print("🚀 Starting Complete End-to-End Latency Benchmark for Llama-3.2-3B Architecture...")
+    print("🚀 Starting End-to-End Latency Benchmark for Llama-3.2-3B...")
 
     config_dict = {
         "hidden_size": 3072,
         "intermediate_size": 8192,
-        "num_hidden_layers": 28,  # Full 28 layers
+        "num_hidden_layers": 28,
         "num_attention_heads": 24,
         "num_key_value_heads": 8,
         "head_dim": 128,
@@ -145,11 +152,9 @@ def run_benchmark():
     }
     config = Llama3BConfig(config_dict)
 
-    # Standard deviation scaling for synthetic weights to avoid overflow
     std_hidden = 1.0 / math.sqrt(config.hidden_size)
     std_inter = 1.0 / math.sqrt(config.intermediate_size)
 
-    # Initialize Cache Manager
     block_size = 16
     cache_manager = KVCacheManager(
         num_blocks=256,
@@ -161,109 +166,100 @@ def run_benchmark():
         device=device
     )
 
-    # Synthetic Weight Population (Full Layer Set)
-    print("Allocating Llama-3.2-3B FP16 Weight Tensors...")
-
-    # 2. Embed Tokens Weight
-    embed_weight = torch.randn((config.vocab_size, config.hidden_size), dtype=torch.float16, device=device) * std_hidden
-
-    weights = {
-        "model.embed_tokens.weight": embed_weight,
-        "model.norm.weight": torch.ones((config.hidden_size,), dtype=torch.float16, device=device),
-        "lm_head.weight": embed_weight
-    }
-
-    # 3. Layer Weight Allocation under torch.inference_mode()
+    print("Allocating FP16 Weight Tensors...")
     with torch.inference_mode():
-      for l in range(config.num_hidden_layers):
-          p = f"model.layers.{l}"
-          weights[f"{p}.input_layernorm.weight"] = torch.ones((config.hidden_size,), dtype=torch.float16, device=device)
-          weights[f"{p}.post_attention_layernorm.weight"] = torch.ones((config.hidden_size,), dtype=torch.float16, device=device)
-          weights[f"{p}.self_attn.q_proj.weight"] = torch.randn((config.num_attention_heads * config.head_dim, config.hidden_size), dtype=torch.float16, device=device) * std_hidden
-          weights[f"{p}.self_attn.k_proj.weight"] = torch.randn((config.num_key_value_heads * config.head_dim, config.hidden_size), dtype=torch.float16, device=device) * std_hidden
-          weights[f"{p}.self_attn.v_proj.weight"] = torch.randn((config.num_key_value_heads * config.head_dim, config.hidden_size), dtype=torch.float16, device=device) * std_hidden
-          weights[f"{p}.self_attn.o_proj.weight"] = torch.randn((config.hidden_size, config.num_attention_heads * config.head_dim), dtype=torch.float16, device=device) * std_hidden
-          weights[f"{p}.mlp.gate_proj.weight"] = torch.randn((config.intermediate_size, config.hidden_size), dtype=torch.float16, device=device) * std_hidden
-          weights[f"{p}.mlp.up_proj.weight"] = torch.randn((config.intermediate_size, config.hidden_size), dtype=torch.float16, device=device) * std_hidden
-          weights[f"{p}.mlp.down_proj.weight"] = torch.randn((config.hidden_size, config.intermediate_size), dtype=torch.float16, device=device) * std_inter
+        embed_weight = torch.randn((config.vocab_size, config.hidden_size), dtype=torch.float16, device=device) * std_hidden
+        weights = {
+            "model.embed_tokens.weight": embed_weight,
+            "model.norm.weight": torch.ones((config.hidden_size,), dtype=torch.float16, device=device),
+            "lm_head.weight": embed_weight
+        }
 
-    # Force Garbage Collection before warm-up
+        for l in range(config.num_hidden_layers):
+            p = f"model.layers.{l}"
+            weights[f"{p}.input_layernorm.weight"] = torch.ones((config.hidden_size,), dtype=torch.float16, device=device)
+            weights[f"{p}.post_attention_layernorm.weight"] = torch.ones((config.hidden_size,), dtype=torch.float16, device=device)
+            weights[f"{p}.self_attn.q_proj.weight"] = torch.randn((config.num_attention_heads * config.head_dim, config.hidden_size), dtype=torch.float16, device=device) * std_hidden
+            weights[f"{p}.self_attn.k_proj.weight"] = torch.randn((config.num_key_value_heads * config.head_dim, config.hidden_size), dtype=torch.float16, device=device) * std_hidden
+            weights[f"{p}.self_attn.v_proj.weight"] = torch.randn((config.num_key_value_heads * config.head_dim, config.hidden_size), dtype=torch.float16, device=device) * std_hidden
+            weights[f"{p}.self_attn.o_proj.weight"] = torch.randn((config.hidden_size, config.num_attention_heads * config.head_dim), dtype=torch.float16, device=device) * std_hidden
+            weights[f"{p}.mlp.gate_proj.weight"] = torch.randn((config.intermediate_size, config.hidden_size), dtype=torch.float16, device=device) * std_hidden
+            weights[f"{p}.mlp.up_proj.weight"] = torch.randn((config.intermediate_size, config.hidden_size), dtype=torch.float16, device=device) * std_hidden
+            weights[f"{p}.mlp.down_proj.weight"] = torch.randn((config.hidden_size, config.intermediate_size), dtype=torch.float16, device=device) * std_inter
+
     gc.collect()
     torch.cuda.empty_cache()
-
 
     model = Llama3BEngineModel(config, weights, cache_manager)
     runner = CUDAGraphRunner(model, max_batch_size=1)
 
-    # Benchmark Parameters
     prompt_len = 512
     generate_tokens = 128
     batch_size = 1
     seq_ids = [0]
-
-    # Pre-allocate sequence in Block Manager
     cache_manager.allocate_sequence(0, prompt_len + generate_tokens)
 
-    # Warmup prefill
     prompt_ids = torch.randint(0, config.vocab_size, (batch_size, prompt_len), dtype=torch.int64, device=device)
     context_lens = torch.tensor([prompt_len], dtype=torch.int32, device=device)
-    _ = prefill_step(model, prompt_ids, seq_ids, context_lens)
-    torch.cuda.synchronize()
 
-    # --- 1. Measure Time to First Token (TTFT - Prefill Phase) ---
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    _ = prefill_step(model, prompt_ids, seq_ids, context_lens)
-    torch.cuda.synchronize()
-    ttft_ms = (time.perf_counter() - t0) * 1000.0
+    # --- 1. Measure Time to First Token (TTFT) with CUDA Events ---
+    with torch.inference_mode():
+        # Warmup passes
+        for _ in range(3):
+            _ = prefill_step(model, prompt_ids, seq_ids, context_lens)
+        torch.cuda.synchronize()
+
+        num_prefill_runs = 10
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+
+        start_event.record()
+        for _ in range(num_prefill_runs):
+            _ = prefill_step(model, prompt_ids, seq_ids, context_lens)
+        end_event.record()
+        torch.cuda.synchronize()
+
+        ttft_ms = start_event.elapsed_time(end_event) / num_prefill_runs
 
     print(f"\n--- Benchmark Results ---")
     print(f"Prompt Length          : {prompt_len} tokens")
     print(f"Time To First Token    : {ttft_ms:.2f} ms")
 
-    # --- 2. Measure Inter-Token Latency (ITL - Autoregressive Decode Phase) ---
-    decode_times = []
-
-    # Compute static MAX blocks for CUDA Graph shape invariance
+    # --- 2. Measure Inter-Token Latency (ITL) with CUDA Events ---
     max_seq_len = prompt_len + generate_tokens
     max_blocks = (max_seq_len + block_size - 1) // block_size
 
     next_input_id = torch.tensor([[101]], dtype=torch.int64, device=device)
-    next_pos = torch.tensor([[prompt_len]], dtype=torch.int32, device=device)
-    curr_context_len = torch.tensor([prompt_len + 1], dtype=torch.int32, device=device)
+    next_pos = torch.zeros((1, 1), dtype=torch.int32, device=device)
+    curr_context_len = torch.zeros((1,), dtype=torch.int32, device=device)
 
-    slot_mapping, block_tables_tensor, _ = runner._prepare_inputs(
-        seq_ids, curr_context_len
-    )
+    # Graph capture warmup
+    next_pos.fill_(prompt_len)
+    curr_context_len.fill_(prompt_len + 1)
+    runner._prepare_inputs(seq_ids, curr_context_len, max_blocks=max_blocks)
+    runner.capture_graph(next_input_id, next_pos, seq_ids, curr_context_len)
 
-    # Warmup graph capture pass
-    runner.capture_graph(
-        next_input_id, next_pos, seq_ids, curr_context_len
-    )
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(generate_tokens)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(generate_tokens)]
 
     print(f"Generating {generate_tokens} tokens...")
-    for i in range(generate_tokens):
-        pos_val = prompt_len + i
-        next_pos.copy_(torch.tensor([[pos_val]], dtype=torch.int32, device=device))
-        curr_context_len = torch.tensor([pos_val + 1], dtype=torch.int32, device=device)
+    with torch.inference_mode():
+        for i in range(generate_tokens):
+            pos_val = prompt_len + i
+            next_pos.fill_(pos_val)
+            curr_context_len.fill_(pos_val + 1)
 
-        slot_mapping, block_tables_tensor, _ = runner._prepare_inputs(
-            seq_ids, curr_context_len, max_blocks = max_blocks
-        )
+            runner._prepare_inputs(seq_ids, curr_context_len, max_blocks=max_blocks)
 
-        torch.cuda.synchronize()
-        t_start = time.perf_counter()
+            start_events[i].record()
+            logits = runner.execute(next_input_id, next_pos, seq_ids, curr_context_len)
+            end_events[i].record()
 
-        logits = runner.execute(
-            next_input_id, next_pos, seq_ids, curr_context_len
-        )
+            next_input_id.copy_(torch.argmax(logits, dim=-1, keepdim=True))
 
         torch.cuda.synchronize()
-        t_end = time.perf_counter()
 
-        decode_times.append((t_end - t_start) * 1000.0)
-        next_input_id.copy_(torch.argmax(logits, dim=-1, keepdim=True))
-
+    decode_times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
     avg_itl_ms = sum(decode_times) / len(decode_times)
     tps = 1000.0 / avg_itl_ms
 
