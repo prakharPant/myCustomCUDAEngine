@@ -42,6 +42,7 @@ myCustomCUDAEngine/
 1. Install Dependencies & Build Engine
 
 Requires CUDA Toolkit and PyTorch.
+```
 Bash
 
 git clone [https://github.com/your-username/myCustomCUDAEngine.git](https://github.com/your-username/myCustomCUDAEngine.git)
@@ -49,9 +50,9 @@ git clone [https://github.com/your-username/myCustomCUDAEngine.git](https://gith
 cd myCustomCUDAEngine
 
 pip install -e .
-
+```
 2. Run Numerical Precision Tests
-
+```
 Bash
 
 PYTHONPATH=. python tests/test_rmsnorm.py
@@ -59,10 +60,11 @@ PYTHONPATH=. python tests/test_rmsnorm.py
 PYTHONPATH=. python tests/test_paged_attention.py
 
 PYTHONPATH=. python tests/test_cuda_graph.py
-
+```
 3. Run Benchmark Suite
 
 Run the full-engine comparison against PyTorch native execution:
+```
 Bash
 
 # Operator microbenchmarks + 28-layer end-to-end prefill comparison
@@ -70,4 +72,4 @@ PYTHONPATH=. python benchmarks/benchmark_engine_vs_pytorch.py
 
 # Prefill attention scaling across context windows (128 -> 32768 tokens)
 PYTHONPATH=. python benchmarks/benchmark_prefill_attn_revised.py
-
+```
