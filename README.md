@@ -45,9 +45,13 @@ Requires CUDA Toolkit and PyTorch.
 Bash
 
 git clone [https://github.com/your-username/myCustomCUDAEngine.git](https://github.com/your-username/myCustomCUDAEngine.git)
+
 cd myCustomCUDAEngine
+
 pip install -e .
+
 2. Run Numerical Precision Tests
+
 Bash
 
 PYTHONPATH=. python tests/test_rmsnorm.py
