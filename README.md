@@ -51,7 +51,9 @@ pip install -e .
 Bash
 
 PYTHONPATH=. python tests/test_rmsnorm.py
+
 PYTHONPATH=. python tests/test_paged_attention.py
+
 PYTHONPATH=. python tests/test_cuda_graph.py
 
 3. Run Benchmark Suite
